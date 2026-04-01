@@ -138,11 +138,15 @@ Give a binary score 'yes' or 'no' score to indicate whether the document is rele
         retries = state.get("retries", 0)
         trajectory = state.get("trajectory", [])
         
-        prompt = f"""You a question re-writer that converts an input user question to a better version that is optimized 
-for vectorstore retrieval. Look at the input and try to reason about the underlying semantic intent / meaning.
-Here is the initial question:
-{question}
-Provide an improved question:"""
+        prompt = f"""Rewrite the question to improve vector database retrieval.
+
+Rules:
+- Use short keyword-style queries
+- Replace vague words with specific system identifiers if possible
+- Keep the query under 12 words
+
+Original Question:
+{question}:"""
 
         response = self.client.models.generate_content(
             model='gemini-2.5-flash',
