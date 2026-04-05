@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+google-genai
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-chroma
+chromadb
+python-dotenv
+gptcache>=0.1.43
+ragas>=0.1.5
