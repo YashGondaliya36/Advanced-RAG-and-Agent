@@ -7,8 +7,6 @@ from google.genai import types
 from langchain_chroma import Chroma
 from gptcache import cache
 from gptcache.manager import get_data_manager
-from gptcache.embedding import Onnx
-from gptcache.similarity_evaluation.distance import SearchDistanceEvaluation
 
 from app.core.config import settings
 from app.utils.document_processor import DocumentProcessor
@@ -33,6 +31,15 @@ class EnterpriseRAGService:
         self.client = genai.Client(api_key=settings.GOOGLE_API_KEY)
         self.embeddings = GeminiEmbeddings(self.client)
         
+        # We define an embedding function matching GPTCache's expected signature
+        def gptcache_embedding_func(query: str):
+            import numpy as np
+            emb = self.embeddings.embed_query(query)
+            # GPTCache's SQLite backend struggles with raw bytes, so we convert to a hex string
+            return np.array(emb, dtype=float).tobytes().hex()
+            
+        self.gptcache_embedding_func = gptcache_embedding_func
+        
         self.vectorstore = Chroma(
             embedding_function=self.embeddings,
             persist_directory=settings.CHROMA_PERSIST_DIR
@@ -45,24 +52,31 @@ class EnterpriseRAGService:
         
     def _init_semantic_cache(self):
         """
-        Initializes GPTCache.
-        It uses a local ONNX model to embed the user's query, 
-        and SQLite to store the generated answer.
+        Initializes GPTCache to use SQLite.
+        We will use our own Gemini embeddings function to bypass ONNX completely.
         """
-        onnx = Onnx()
         data_manager = get_data_manager(
             data_path=settings.CACHE_PERSIST_DIR, 
-            max_size=1000,
-            # We store the question vector and the cached text answer
+            max_size=1000
         )
+        
+        # We define a custom evaluation function so we can specify the threshold safely
+        def evaluate_func(query_data, cache_data):
+            import numpy as np
+            # Convert hex strings back to numpy arrays for math
+            q_emb = np.frombuffer(bytes.fromhex(query_data), dtype=float)
+            c_emb = np.frombuffer(bytes.fromhex(cache_data), dtype=float)
+            score = np.dot(q_emb, c_emb) / (np.linalg.norm(q_emb) * np.linalg.norm(c_emb))
+            logger.info(f"Semantic Cache Comparison Score: {score}")
+            # Dropped threshold to 0.85 to allow for more linguistic variation!
+            return score > 0.85
+
         cache.init(
-            embedding_func=onnx.to_embeddings,
+            embedding_func=self.gptcache_embedding_func,
             data_manager=data_manager,
-            similarity_evaluation=SearchDistanceEvaluation(),
-            # If a new query is 90% semantically similar to an old query, return the cache!
-            similarity_threshold=0.9 
+            similarity_evaluation=evaluate_func
         )
-        logger.info("Semantic Cache Initialized.")
+        logger.info("Semantic Cache Initialized using Gemini Embeddings.")
 
     async def ingest_text(self, text: str, source: str) -> int:
         docs = self.document_processor.process_text(text, source)
@@ -76,16 +90,26 @@ class EnterpriseRAGService:
         
         # --- SEMANTIC CACHE CHECK ---
         if use_cache:
-            # We search the cache for a similar question
-            cache_result = cache.get(question)
-            if cache_result:
-                logger.info("---CACHE HIT!--- Bypassing LLM completely.")
-                return {
-                    "answer": cache_result,
-                    "sources": ["semantic_cache"],
-                    "cache_hit": True,
-                    "latency_ms": round((time.time() - start_time) * 1000, 2)
-                }
+            # Embed the question using Gemini and convert to bytes
+            embedded_question = self.gptcache_embedding_func(question)
+            
+            # We search the cache for a similar question using the embedded vector bytes
+            cache_data_list = cache.data_manager.search(
+                embedded_question
+            )
+            
+            if cache_data_list:
+                # We need to manually run the similarity evaluation on the results
+                for cache_data in cache_data_list:
+                    if cache.similarity_evaluation(embedded_question, cache_data[1]):
+                        logger.info("---CACHE HIT!--- Bypassing LLM completely.")
+                        best_match_answer = cache.data_manager.get(cache_data[0]).answer
+                        return {
+                            "answer": best_match_answer,
+                            "sources": ["semantic_cache"],
+                            "cache_hit": True,
+                            "latency_ms": round((time.time() - start_time) * 1000, 2)
+                        }
 
         # --- NORMAL RAG WORKFLOW (CACHE MISS) ---
         logger.info("---CACHE MISS. Executing RAG workflow.---")
@@ -108,7 +132,11 @@ Answer:"""
         
         # --- SAVE TO CACHE FOR FUTURE QUERIES ---
         if use_cache:
-            cache.put(question, final_answer)
+            cache.data_manager.save(
+                question,
+                final_answer,
+                self.gptcache_embedding_func(question)
+            )
             logger.info("Answer saved to Semantic Cache.")
             
         return {
