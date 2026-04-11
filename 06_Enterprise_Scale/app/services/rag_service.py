@@ -1,17 +1,23 @@
 import logging
 import time
-from typing import Dict, Any, List
+from typing import Any, Dict
+
+import numpy as np
 from google import genai
 from google.genai import types
 
 from langchain_chroma import Chroma
 from gptcache import cache
-from gptcache.manager import get_data_manager
+from gptcache.manager.scalar_data.base import Answer
+from gptcache.similarity_evaluation import ExactMatchEvaluation
 
 from app.core.config import settings
 from app.utils.document_processor import DocumentProcessor
 
 logger = logging.getLogger(__name__)
+
+CACHE_SIMILARITY_THRESHOLD = 0.85
+
 
 class GeminiEmbeddings:
     def __init__(self, client: genai.Client):
@@ -33,10 +39,9 @@ class EnterpriseRAGService:
         
         # We define an embedding function matching GPTCache's expected signature
         def gptcache_embedding_func(query: str):
-            import numpy as np
             emb = self.embeddings.embed_query(query)
-            # GPTCache's SQLite backend struggles with raw bytes, so we convert to a hex string
-            return np.array(emb, dtype=float).tobytes().hex()
+            # Just return the raw list of floats. Faiss will handle it.
+            return np.array(emb, dtype=np.float32)
             
         self.gptcache_embedding_func = gptcache_embedding_func
         
@@ -53,28 +58,25 @@ class EnterpriseRAGService:
     def _init_semantic_cache(self):
         """
         Initializes GPTCache to use SQLite.
-        We will use our own Gemini embeddings function to bypass ONNX completely.
         """
-        data_manager = get_data_manager(
-            data_path=settings.CACHE_PERSIST_DIR, 
-            max_size=1000
-        )
+        from gptcache.manager import get_data_manager, CacheBase, VectorBase
         
-        # We define a custom evaluation function so we can specify the threshold safely
-        def evaluate_func(query_data, cache_data):
-            import numpy as np
-            # Convert hex strings back to numpy arrays for math
-            q_emb = np.frombuffer(bytes.fromhex(query_data), dtype=float)
-            c_emb = np.frombuffer(bytes.fromhex(cache_data), dtype=float)
-            score = np.dot(q_emb, c_emb) / (np.linalg.norm(q_emb) * np.linalg.norm(c_emb))
-            logger.info(f"Semantic Cache Comparison Score: {score}")
-            # Dropped threshold to 0.85 to allow for more linguistic variation!
-            return score > 0.85
+        # Test embed to dynamically find exactly how many dimensions Gemini is returning
+        test_emb = self.embeddings.embed_query("test")
+        gemini_dim = len(test_emb)
+        logger.info(f"Gemini Embedding Dimension Detected: {gemini_dim}")
+        
+        data_manager = get_data_manager(
+            CacheBase("sqlite", sql_url=f"sqlite:///{settings.CACHE_PERSIST_DIR}"),
+            VectorBase("faiss", dimension=gemini_dim, top_k=5),
+            max_size=1000,
+        )
 
+        # Similarity for HTTP path is computed in query(); this satisfies cache.init API.
         cache.init(
             embedding_func=self.gptcache_embedding_func,
             data_manager=data_manager,
-            similarity_evaluation=evaluate_func
+            similarity_evaluation=ExactMatchEvaluation(),
         )
         logger.info("Semantic Cache Initialized using Gemini Embeddings.")
 
@@ -85,31 +87,79 @@ class EnterpriseRAGService:
             logger.info(f"Ingested {len(docs)} chunks into ChromaDB.")
         return len(docs)
 
+    @staticmethod
+    def _cosine_similarity(query_vec: np.ndarray, cache_vec: np.ndarray) -> float:
+        query_arr = np.asarray(query_vec, dtype=np.float64).ravel()
+        cache_arr = np.asarray(cache_vec, dtype=np.float64).ravel()
+        if query_arr.size == 0 or cache_arr.size == 0 or query_arr.size != cache_arr.size:
+            return -1.0
+        query_norm = float(np.linalg.norm(query_arr))
+        cache_norm = float(np.linalg.norm(cache_arr))
+        if query_norm == 0.0 or cache_norm == 0.0:
+            return -1.0
+        query_unit = query_arr / query_norm
+        cache_unit = cache_arr / cache_norm
+        return float(np.dot(query_unit, cache_unit))
+
+    @staticmethod
+    def _first_answer_text(cache_row) -> str:
+        first = cache_row.answers[0]
+        if isinstance(first, Answer):
+            return first.answer
+        return first
+
     async def query(self, question: str, use_cache: bool = True) -> Dict[str, Any]:
         start_time = time.time()
         
         # --- SEMANTIC CACHE CHECK ---
         if use_cache:
-            # Embed the question using Gemini and convert to bytes
+            # Embed the question using Gemini and convert to Hex
             embedded_question = self.gptcache_embedding_func(question)
             
-            # We search the cache for a similar question using the embedded vector bytes
-            cache_data_list = cache.data_manager.search(
-                embedded_question
-            )
+            logger.info("🔍 Searching SQLite Cache for similar vectors...")
             
-            if cache_data_list:
-                # We need to manually run the similarity evaluation on the results
-                for cache_data in cache_data_list:
-                    if cache.similarity_evaluation(embedded_question, cache_data[1]):
-                        logger.info("---CACHE HIT!--- Bypassing LLM completely.")
-                        best_match_answer = cache.data_manager.get(cache_data[0]).answer
+            # FAISS returns [(distance, row_id), ...]; embeddings live in scalar storage.
+            search_rows = cache.data_manager.search(embedded_question, top_k=5)
+            if search_rows is None:
+                search_rows = []
+
+            if search_rows:
+                logger.info(
+                    "📁 Found %s potential match(es). Scoring cosine similarity vs stored embeddings.",
+                    len(search_rows),
+                )
+                for search_row in search_rows:
+                    cache_row = cache.data_manager.get_scalar_data(search_row)
+                    if cache_row is None or cache_row.embedding_data is None:
+                        logger.info("❌ ---CACHE MISS--- Row missing or has no embedding_data.")
+                        continue
+
+                    score_val = self._cosine_similarity(
+                        embedded_question, cache_row.embedding_data
+                    )
+                    logger.info(
+                        "📊 Semantic cache score: %.4f (threshold: %.2f)",
+                        score_val,
+                        CACHE_SIMILARITY_THRESHOLD,
+                    )
+                    if score_val >= CACHE_SIMILARITY_THRESHOLD:
+                        logger.info(
+                            "✅ ---CACHE HIT--- Similarity >= %.2f. Bypassing LLM.",
+                            CACHE_SIMILARITY_THRESHOLD,
+                        )
+                        cache.data_manager.hit_cache_callback(search_row)
                         return {
-                            "answer": best_match_answer,
+                            "answer": self._first_answer_text(cache_row),
                             "sources": ["semantic_cache"],
                             "cache_hit": True,
-                            "latency_ms": round((time.time() - start_time) * 1000, 2)
+                            "latency_ms": round((time.time() - start_time) * 1000, 2),
                         }
+                    logger.info(
+                        "❌ ---CACHE MISS (THRESHOLD)--- Neighbor below %.2f.",
+                        CACHE_SIMILARITY_THRESHOLD,
+                    )
+            else:
+                logger.info("❌ ---CACHE MISS (EMPTY)--- No nearby vectors in FAISS.")
 
         # --- NORMAL RAG WORKFLOW (CACHE MISS) ---
         logger.info("---CACHE MISS. Executing RAG workflow.---")
