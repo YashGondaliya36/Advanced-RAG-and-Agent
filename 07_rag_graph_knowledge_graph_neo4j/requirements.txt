@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+langchain
+langchain-community
+langchain-core
+google-genai
+langchain-google-genai
+
+# Neo4j and LangChain Experimental (contains LLMGraphTransformer)
+neo4j
+langchain-neo4j
+langchain-experimental
