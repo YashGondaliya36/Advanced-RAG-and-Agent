@@ -1,0 +1,12 @@
+google-genai
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+langchain-chroma
+chromadb
+python-multipart
+sentence-transformers
+PyMuPDF
+Pillow
+

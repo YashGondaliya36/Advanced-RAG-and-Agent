@@ -16,6 +16,8 @@ All language-model calls use **Google Gemini** (generation and embeddings via th
 | [`04_rag_post_retrieval_rerank_compress`](04_rag_post_retrieval_rerank_compress/) | After retrieval | **Cross-encoder–style reranking (FlashRank)**, **contextual compression**, **long-context reordering** (“lost in the middle” mitigation) |
 | [`05_rag_agentic_langgraph`](05_rag_agentic_langgraph/) | Non-linear pipelines | **LangGraph**, **CRAG / Self-RAG–style** loops, **LLM grading** of documents, **query rewriting** |
 | [`06_rag_production_semantic_cache_eval`](06_rag_production_semantic_cache_eval/) | Production concerns | **Semantic caching (GPTCache + FAISS + SQLite)**, **RAGAS**-style evaluation hooks |
+| [`07_rag_graph_knowledge_graph_neo4j`](07_rag_graph_knowledge_graph_neo4j/) | Relational context | **GraphRAG**, **Neo4j**, **LLMGraphTransformer**, converting unstructured data to knowledge graphs, custom **Cypher generation** |
+| [`08_rag_multimodal_vision`](08_rag_multimodal_vision/) | Multimodal data | **Native Multimodal Embeddings (`gemini-embedding-2`)**, direct PDF/Image ingestion, cross-modal retrieval, **Vision-Language Generation (`gemini-2.5-flash`)** |
 
 Read the **README inside each directory** for the exact API, request fields, and run commands.
 
